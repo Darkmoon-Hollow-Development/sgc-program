@@ -1,5 +1,5 @@
 -- Stargate Command dialing computer, by Darkmoon Hollow (also built into the Eclipse Gate mod)
--- For Just Stargate Mod + CC: Tweaked. Install: pastebin get <code> sgc   or   wget <link> sgc
+-- For Just Stargate Mod + CC: Tweaked. Install: wget https://raw.githubusercontent.com/Darkmoon-Hollow-Development/SGC-Dialing-Program/main/sgc.lua sgc
 -- An SGC-style dialing screen for a Just Stargate Mod gate: the gate and its chevrons, the address being dialed,
 -- an address book, the iris and IDC codes. The address book and IDC list are kept on this computer in /sgc/data.
 

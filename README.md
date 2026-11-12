@@ -29,16 +29,17 @@ Made by Darkmoon Hollow. It's also built into the Eclipse Gate mod, which sets i
 On the computer:
 
 ```
-pastebin get <code> sgc
+wget https://raw.githubusercontent.com/Darkmoon-Hollow-Development/SGC-Dialing-Program/main/sgc.lua sgc
 ```
 
-or, from a direct link to `sgc.lua`:
+Then run `sgc`. To update to the newest version later, delete the old one and get it again (your address book, IDC codes and log are kept):
 
 ```
-wget <link to sgc.lua> sgc
+delete sgc
+wget https://raw.githubusercontent.com/Darkmoon-Hollow-Development/SGC-Dialing-Program/main/sgc.lua sgc
 ```
 
-Then run `sgc`. To have it start whenever the computer boots:
+To have it start whenever the computer boots:
 
 ```
 label set "Stargate Command"
@@ -50,6 +51,8 @@ and put this one line in `startup`:
 ```
 shell.run("sgc")
 ```
+
+If `wget` says the domain isn't allowed, the server has turned off CC: Tweaked's internet access (`http` in `computercraft-server.toml`); `raw.githubusercontent.com` is allowed by default.
 
 ## Using it
 
