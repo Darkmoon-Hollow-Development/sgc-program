@@ -1,13 +1,17 @@
 -- Stargate Command dialing computer, by Darkmoon Hollow (also built into the Eclipse Gate mod)
 -- For Just Stargate Mod + CC: Tweaked. Install: wget https://raw.githubusercontent.com/Darkmoon-Hollow-Development/SGC-Dialing-Program/main/sgc.lua sgc
--- An SGC-style dialing screen for a Just Stargate Mod gate: the gate and its chevrons, the address being dialed,
--- an address book, the iris and IDC codes. The address book and IDC list are kept on this computer in /sgc/data.
+-- An SGC-style dialing screen for a Just Stargate Mod gate: the gate with its spinning ring and chevrons, the address
+-- being dialed, an address book, the iris and IDC codes, sounds through any speaker, the base alert and a self-destruct,
+-- and a pocket-computer remote over rednet ("sgc remote"). Everything it keeps is in /sgc on this computer.
+
+local args = { ... }
 
 local DATA = "/sgc/data"
 local ORIGIN = { "Point of Origin", "Point of origin", 0 }
 
 local gate, gateName = nil, nil
 local mon = nil
+local speakers = {}
 
 -- ------------------------------------------------------------------ saved data
 
@@ -17,6 +21,10 @@ local data = {
     autoIris = true,
     alarm = true,      -- the base alert: the computer's redstone (and the lamps beside it) flash on an incoming wormhole
     history = {},      -- name -> { count, last } for every address that's been dialed
+    fav = {},          -- name -> true for the address book's favourites (listed first)
+    fastDial = false,  -- dial the whole address at once (JSG's own dialing, like a DHD) instead of chevron by chevron
+    sounds = true,     -- chevrons, klaxon and kawoosh through any speaker on the computer
+    remoteCode = nil,  -- the code a pocket computer needs to use this computer ("sgc remote"); none = no remote
 }
 
 local function loadData()
@@ -32,6 +40,10 @@ local function loadData()
         if loaded.alarm ~= nil then data.alarm = loaded.alarm end
         data.history = loaded.history or {}
         data.last = loaded.last
+        data.fav = loaded.fav or {}
+        data.fastDial = loaded.fastDial and true or false
+        if loaded.sounds ~= nil then data.sounds = loaded.sounds end
+        data.remoteCode = loaded.remoteCode
     end
 end
 
@@ -118,6 +130,44 @@ local function findDevices()
             end
         end
     end
+    speakers = {}
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name) == "speaker" then table.insert(speakers, peripheral.wrap(name)) end
+    end
+    -- every modem, wired or wireless, so the pocket remote can reach this computer
+    if rednet then
+        for _, name in ipairs(peripheral.getNames()) do
+            if peripheral.getType(name) == "modem" then pcall(rednet.open, name) end
+        end
+    end
+end
+
+-- ------------------------------------------------------------------ sounds (through every speaker it can see)
+
+local SOUNDS = {
+    key = { "jsg:block.dhd.milkyway.press", 0.5, 1.2 },
+    chevron = { "jsg:block.dhd.milkyway.press", 1, 0.9 },
+    lock = { "minecraft:block.anvil.place", 0.35, 1.5 },
+    open = { "jsg:block.stargate.milkyway.open", 1, 1 },
+    close = { "jsg:block.stargate.milkyway.close", 1, 1 },
+    fail = { "jsg:block.stargate.milkyway.fail_computer", 1, 1 },
+    incoming = { "jsg:block.stargate.milkyway.chevron.incoming", 1, 1 },
+    irisOpen = { "jsg:misc.stargate.iris.open", 1, 1 },
+    irisClose = { "jsg:misc.stargate.iris.close", 1, 1 },
+    gdo = { "jsg:misc.gui.gdo.button", 1, 1 },
+    travel = { "jsg:misc.stargate.wormhole.travel", 0.6, 1 },
+    accept = { "minecraft:block.note_block.chime", 1, 1.4 },
+    reject = { "minecraft:block.note_block.bass", 1, 0.6 },
+    klaxon = { "minecraft:block.note_block.didgeridoo", 1, 0.8 },
+    siren = { "minecraft:block.note_block.bit", 1, 0.6 },
+    boom = { "minecraft:entity.generic.explode", 1, 0.6 },
+}
+
+local function sound(kind, pitch)
+    if not data.sounds or #speakers == 0 then return end
+    local s = SOUNDS[kind]
+    if not s then return end
+    for _, sp in ipairs(speakers) do pcall(sp.playSound, s[1], s[2], math.min(2, s[3] * (pitch or 1))) end
 end
 
 -- ------------------------------------------------------------------ the gate
@@ -126,6 +176,12 @@ local state = {
     status = "", iris = "", energy = 0, message = "STANDING BY", detail = "",
     address = {}, locked = 0, total = 0,       -- the address being dialed, and how many chevrons are locked
     incoming = false, open = false, dialing = nil, autoClosed = false, error = nil,
+    ringAngle = 0, ringTarget = nil, spinDir = 1,   -- the screen's ring: where it is, where it's turning to, which way
+    engaging = nil,                                 -- the symbol being encoded right now (under the top chevron)
+    flash = {},                                     -- chevron -> when it locked (it flashes for a moment)
+    kawoosh = nil, irisAnim = nil,                  -- when the wormhole burst open; the iris opening or closing
+    travellers = 0,                                 -- through the gate since the wormhole opened
+    destruct = nil, destructArm = nil, detonated = nil,
 }
 
 -- Calls a gate method safely: returns ok, first result, and a message on failure.
@@ -175,11 +231,25 @@ local function refresh()
     end
     local s = ask("getGateStatus")
     state.status = s and string.upper(tostring(s)) or "?"
+    local before = state.iris
     s = ask("getIrisState")
     state.iris = s and string.upper(tostring(s)) or "NONE"
+    if before ~= "" and before ~= state.iris then             -- the iris started moving: animate it, and hear it
+        if string.find(state.iris, "CLOSING") then
+            state.irisAnim = { closing = true, t = os.clock() }
+            sound("irisClose")
+        elseif string.find(state.iris, "OPENING") then
+            state.irisAnim = { closing = false, t = os.clock() }
+            sound("irisOpen")
+        end
+    end
+    local wasOpen = state.open
     state.energy = tonumber(ask("getEnergyStored")) or 0
     state.maxEnergy = tonumber(ask("getMaxEnergyStored")) or state.maxEnergy or 0
     state.open = string.find(state.status, "OPEN") ~= nil or string.find(state.status, "ENGAGED") ~= nil
+    if state.open and not wasOpen and not (state.kawoosh and os.clock() - state.kawoosh < 5) then
+        state.kawoosh = os.clock()
+    end
     if state.open and not state.openedAt then
         local mins, secs = keyed("getOpenedTime")
         state.openedAt = os.clock() - ((tonumber(mins) or 0) * 60 + (tonumber(secs) or 0))
@@ -229,6 +299,7 @@ local function newCanvas(cw, ch)
 end
 
 function Canvas:set(x, y, colour)
+    if not colour then return end
     x, y = math.floor(x + 0.5), math.floor(y + 0.5)
     if x < 1 or y < 1 or x > self.pw or y > self.ph then return end
     self.px[(y - 1) * self.pw + x] = colour
@@ -327,7 +398,7 @@ local FONT = {
     Z = "111001010100111", ["0"] = "111101101101111", ["1"] = "010110010010111", ["2"] = "110001010100111",
     ["3"] = "110001010001110", ["4"] = "101101111001001", ["5"] = "111100110001110", ["6"] = "011100111101111",
     ["7"] = "111001010010010", ["8"] = "111101111101111", ["9"] = "111101111001110", [" "] = "000000000000000",
-    ["-"] = "000000111000000",
+    ["-"] = "000000111000000", [":"] = "000010000010000",
 }
 
 function Canvas:bigText(cx, y, s, scale, colour)
@@ -403,28 +474,62 @@ function Canvas:triOutline(x1, y1, x2, y2, x3, y3, colour)
     self:line(x3, y3, x1, y1, colour)
 end
 
--- the gate: double cyan rings with the 39 glyph positions ticked between them, nine chevrons (red outlines, filled
--- red once locked, the top one flashing as it clamps); in the middle the orange core when idle, the event horizon,
--- or the iris's vanes
+-- The Milky Way glyphs round the ring, in JSG's order (the point of origin among them), so the screen's ring turns to
+-- each symbol as the real one does.
+local RING = {
+    "Sculptor", "Scorpius", "Centaurus", "Monoceros", "Point of Origin", "Pegasus", "Andromeda", "Serpens Caput", "Aries",
+    "Libra", "Eridanus", "Leo Minor", "Hydra", "Sagittarius", "Sextans", "Scutum", "Pisces", "Virgo", "Bootes", "Auriga",
+    "Corona Australis", "Gemini", "Leo", "Cetus", "Triangulum", "Aquarius", "Microscopium", "Equuleus", "Crater",
+    "Perseus", "Cancer", "Norma", "Taurus", "Canis Minor", "Capricornus", "Lynx", "Orion", "Piscis Austrinus",
+}
+local RING_INDEX = {}
+for i, name in ipairs(RING) do RING_INDEX[string.lower(name)] = i end
+
+-- The symbol's proper name (any case, "point of origin" for the origin), or nil if it isn't a Milky Way glyph.
+local function glyphName(symbol)
+    local i = RING_INDEX[string.lower(tostring(symbol or ""))]
+    return i and RING[i] or nil
+end
+
+-- The ring angle (degrees, clockwise) that brings a symbol to the top chevron.
+local function ringAngleFor(symbol)
+    local i = RING_INDEX[string.lower(tostring(symbol or ""))]
+    if not i then return nil end
+    return (-(i - 1) * 360 / #RING) % 360
+end
+
+-- A little mark for each glyph between the ring's bands: six dots in two columns of three, a pattern of its own.
+local GLYPH_BITS = {}
+for i = 1, #RING do
+    local h = (i * 40503 + 12345) % 65536
+    local bits = (math.floor(h / 97) % 63) + 1
+    GLYPH_BITS[i] = bits
+end
+
+-- the gate: the outer ring with every glyph marked between its bands (turning while it dials, the symbol being encoded
+-- lit under the top chevron), nine chevrons (red outlines, filled red once locked, flashing as they lock, the top one
+-- opening as it clamps); in the middle the orange core when idle, the kawoosh, the rippling event horizon, and the
+-- iris's vanes closing in or opening out over it
 local function drawGate(c, cx, cy, r, blink, tick)
+    local now = os.clock()
     local lit = {}
     local order = lockOrder(math.max(state.total, 7))
     for i = 1, math.min(state.locked, #order) do lit[order[i]] = true end
     if state.open and state.total == 0 then for k in pairs(CHEVRON_ANGLE) do lit[k] = true end end
     local inner = r - 7
-    if irisClosed() then
+    local kaw = state.kawoosh and (now - state.kawoosh) or nil
+    if kaw and kaw > 2.4 then
+        state.kawoosh = nil
+        kaw = nil
+    end
+    -- the middle
+    if state.open or kaw then
         c:disc(cx, cy, inner, function(d, dx, dy)
-            local a = (math.deg(math.atan2(dy, dx)) + 360 + d * 9) % 360
-            if d > inner - 1 then return colors.gray end
-            return (math.floor(a / 18) % 2 == 0) and colors.lightGray or colors.gray      -- twenty vanes in a spiral
-        end)
-    elseif state.open then
-        c:disc(cx, cy, inner, function(d, dx, dy)
-            local a = math.deg(math.atan2(dy, dx))
-            local wave = (d * 0.9 + math.sin(math.rad(a * 3 + tick * 40)) * 0.8 + tick * 0.6) % 4
-            if d < 1.5 then return colors.white end
-            if wave < 0.9 then return colors.lightBlue end
-            if wave < 1.4 and d < inner * 0.6 then return colors.white end
+            local a = math.atan2(dy, dx)
+            local wave = (d * 0.8 - now * 6 + math.sin(a * 3 + now * 2) * 0.7) % 4
+            if d < 1.5 + math.sin(now * 5) * 0.5 then return colors.white end
+            if wave < 0.8 then return colors.lightBlue end
+            if wave < 1.2 and d < inner * 0.55 then return colors.white end
             return colors.blue
         end)
     else
@@ -435,14 +540,64 @@ local function drawGate(c, cx, cy, r, blink, tick)
             return colors.red
         end)
     end
-    -- the rings and the 39 glyph positions
+    -- the iris: twenty vanes in a spiral, closing in from the rim or opening back out to it
+    local shut = irisClosed() and 1 or 0
+    if state.irisAnim then
+        local p = math.min(1, (now - state.irisAnim.t) / 2.5)
+        shut = state.irisAnim.closing and p or (1 - p)
+        if p >= 1 then state.irisAnim = nil end
+    end
+    if shut > 0 then
+        local hole = inner * (1 - shut)
+        c:disc(cx, cy, inner, function(d, dx, dy)
+            if d < hole then return nil end
+            if d > inner - 1 then return colors.gray end
+            local a = (math.deg(math.atan2(dy, dx)) + 360 + d * 9 + shut * 40) % 360
+            return (math.floor(a / 18) % 2 == 0) and colors.lightGray or colors.gray
+        end)
+    end
+    -- the ring: two bands, and every glyph's mark between them
     c:ring(cx, cy, r, colors.cyan)
     c:ring(cx, cy, r - 1, colors.cyan)
     c:ring(cx, cy, r - 5, colors.cyan)
     c:ring(cx, cy, inner, colors.cyan)
-    for i = 0, 38 do
-        local a = math.rad(i * 360 / 39)
-        c:line(cx + math.sin(a) * (r - 2), cy - math.cos(a) * (r - 2), cx + math.sin(a) * (r - 4), cy - math.cos(a) * (r - 4), colors.gray)
+    local inAddress = {}
+    for k = 1, state.locked do
+        local i = RING_INDEX[string.lower(tostring(state.address[k] or ""))]
+        if i then inAddress[i] = true end
+    end
+    local engagingIndex = state.engaging and RING_INDEX[string.lower(state.engaging)] or nil
+    for i = 1, #RING do
+        local a = math.rad((i - 1) * 360 / #RING + state.ringAngle)
+        local sx, sy = math.sin(a), -math.cos(a)
+        local tx, ty = -sy, sx
+        local colour = colors.gray
+        if i == 5 then colour = colors.brown end                      -- the point of origin
+        if inAddress[i] then colour = colors.white end
+        if i == engagingIndex then colour = blink and colors.yellow or colors.white end
+        local bits = GLYPH_BITS[i]
+        for row = 0, 2 do
+            for col = 0, 1 do
+                if math.floor(bits / 2 ^ (row * 2 + col)) % 2 == 1 then
+                    local rr = r - 2 - row
+                    local off = col == 0 and -0.7 or 0.7
+                    c:set(cx + sx * rr + tx * off, cy + sy * rr + ty * off, colour)
+                end
+            end
+        end
+    end
+    -- the kawoosh: the wormhole bursts out past the ring, then falls back into the event horizon
+    if kaw and kaw < 1.4 then
+        local t = kaw / 1.4
+        local reach = t < 0.4 and (inner * (0.4 + 1.6 * t / 0.4)) or (inner * (2.0 - 1.0 * (t - 0.4) / 0.6))
+        c:disc(cx, cy, reach, function(d, dx, dy)
+            local a = math.atan2(dy, dx)
+            local edge = reach * (0.82 + 0.18 * math.sin(a * 7 + now * 9))
+            if d > edge then return nil end
+            if d < edge * 0.45 then return colors.white end
+            if d < edge * 0.75 then return colors.lightBlue end
+            return colors.blue
+        end)
     end
     -- HUD brackets round the gate
     local b = r + 7
@@ -457,17 +612,20 @@ local function drawGate(c, cx, cy, r, blink, tick)
         local a = math.rad(deg)
         local sx, sy = math.sin(a), -math.cos(a)            -- out from the middle
         local tx, ty = -sy, sx                              -- along the ring
-        local locking = (k == 7 and state.dialing and state.locked == state.total - 1 and state.total > 0)
+        local opening = k == 7 and state.engaging ~= nil    -- the top chevron lifts as each symbol comes under it
+        local lift = opening and 1.5 or 0
         local colour = colors.red
-        if locking and blink then colour = colors.yellow end
-        local ox, oy = cx + sx * (r + 3), cy + sy * (r + 3)
-        local ix, iy = cx + sx * (r - 3), cy + sy * (r - 3)
-        if lit[k] then
+        local f = state.flash[k]
+        if f and now - f < 0.8 then colour = blink and colors.white or colors.yellow end
+        if opening then colour = blink and colors.yellow or colors.orange end
+        local ox, oy = cx + sx * (r + 3 + lift), cy + sy * (r + 3 + lift)
+        local ix, iy = cx + sx * (r - 3 + lift), cy + sy * (r - 3 + lift)
+        if lit[k] or opening then
             c:triangle(ox + tx * 4, oy + ty * 4, ox - tx * 4, oy - ty * 4, ix, iy, colour)
-            local nx, ny = cx + sx * (r + 3.5), cy + sy * (r + 3.5)
-            c:triangle(nx + tx * 2, ny + ty * 2, nx - tx * 2, ny - ty * 2, cx + sx * (r - 0.5), cy + sy * (r - 0.5), colors.black)
+            local nx, ny = cx + sx * (r + 3.5 + lift), cy + sy * (r + 3.5 + lift)
+            c:triangle(nx + tx * 2, ny + ty * 2, nx - tx * 2, ny - ty * 2, cx + sx * (r - 0.5 + lift), cy + sy * (r - 0.5 + lift), colors.black)
         else
-            c:triOutline(ox + tx * 4, oy + ty * 4, ox - tx * 4, oy - ty * 4, ix, iy, locking and colour or colors.red)
+            c:triOutline(ox + tx * 4, oy + ty * 4, ox - tx * 4, oy - ty * 4, ix, iy, colors.red)
         end
     end
 end
@@ -487,12 +645,12 @@ if fs.exists(LOG) then
     if type(loaded) == "table" then log = loaded end
 end
 
-local function logEvent(short, long, colour)
+local function logEvent(short, long, colour, kind)
     local t = ""
     if textutils and textutils.formatTime and os.time then t = textutils.formatTime(os.time(), true) end
     if #t == 4 then t = "0" .. t end
     local day = os.day and os.day() or nil
-    table.insert(log, { t = t, day = day, short = string.upper(short), long = string.upper(long or short), c = colour or colors.lightBlue })
+    table.insert(log, { t = t, day = day, short = string.upper(short), long = string.upper(long or short), c = colour or colors.lightBlue, kind = kind })
     while #log > 200 do table.remove(log, 1) end
     if logScroll > 0 then logScroll = logScroll + 1 end           -- keep looking at the same events
     local f = fs.open(LOG, "w")
@@ -598,6 +756,8 @@ local actions = {}
 local overlay = false                -- the KEYBOARD overlay: the address book, manual dialing, IDC codes, the gate
 local page = "book"
 local bookScroll, bookSel = 0, 1
+local bookFilter, bookSort, bookLetter = "all", "name", nil
+local logFilter = nil                -- "travel": only who went through the gate
 local idcScroll = 0
 local manual = {}                    -- the address being put together glyph by glyph on the MANUAL DIAL page
 local hexes = {}
@@ -646,6 +806,54 @@ local function drawAddress(c, x1, x2, row, symbols, cols, needed)
     return row + per * 2
 end
 
+-- How far a gate is from Stargate Command's own, in blocks, when it's in the same world.
+local function distanceTo(entry)
+    if not (home and home.x and entry.x and home.dim == entry.dim) then return nil end
+    return math.floor(math.sqrt((entry.x - home.x) ^ 2 + (entry.z - home.z) ^ 2))
+end
+
+-- Which group of worlds a destination is in, for the address book's SHOW button.
+local function worldOf(entry)
+    local dim = entry.dim
+    if not dim then return "other" end
+    if dim == "minecraft:overworld" then return "overworld" end
+    if dim == "eclipsegate:moonlit_hollow" then return "hollow" end
+    if string.match(dim, "^gtg:") then return "planets" end
+    return "other"
+end
+
+local FILTERS = { "all", "fav", "overworld", "hollow", "planets", "other" }
+local FILTER_LABEL = { all = "ALL", fav = "FAVOURITES", overworld = "OVERWORLD", hollow = "THE HOLLOW", planets = "PLANETS", other = "OTHER WORLDS" }
+local SORTS = { "name", "distance", "dialed", "book" }
+local SORT_LABEL = { name = "NAME", distance = "DISTANCE", dialed = "MOST DIALED", book = "BOOK ORDER" }
+
+-- The address book as the page shows it: filtered by world (or favourites) and first letter, sorted, favourites first.
+local function bookView()
+    local out = {}
+    for n, e in ipairs(entries()) do
+        e.fav = data.fav[e.name] and true or false
+        e.order = n
+        local keep = true
+        if bookFilter == "fav" then keep = e.fav
+        elseif bookFilter ~= "all" then keep = worldOf(e) == bookFilter end
+        if keep and bookLetter and string.upper(string.sub(e.name, 1, 1)) ~= bookLetter then keep = false end
+        if keep then table.insert(out, e) end
+    end
+    local function key(e)
+        if bookSort == "distance" then return distanceTo(e) or 1e12 end
+        if bookSort == "dialed" then return -((data.history[e.name] or {}).count or 0) end
+        if bookSort == "book" then return e.order end
+        return 0
+    end
+    table.sort(out, function(a, b)
+        if a.fav ~= b.fav then return a.fav end
+        local ka, kb = key(a), key(b)
+        if ka ~= kb then return ka < kb end
+        return string.lower(a.name) < string.lower(b.name)
+    end)
+    return out
+end
+
 -- the KEYBOARD overlay's pages
 local function drawOverlay(c, W, H, PW, PH, frame)
     local o1, o2 = 10, PW - 10
@@ -667,37 +875,71 @@ local function drawOverlay(c, W, H, PW, PH, frame)
     c:line(o1 + 2, 15, o2 - 2, 15, frame)
 
     if page == "book" then
-        local book = entries()
+        local book = bookView()
         local listW = math.max(16, math.floor((X2 - X1) * 0.36))
-        local rows = bottom - top - 1
+        -- above the list: which worlds, and in what order
+        local fx = X1
+        local fl = FILTER_LABEL[bookFilter] or "ALL"
+        fx = button(c, fx, top, "SHOW: " .. fl, colors.gray, colors.white, function()
+            for i, f in ipairs(FILTERS) do
+                if f == bookFilter then bookFilter = FILTERS[i % #FILTERS + 1] break end
+            end
+            bookSel, bookScroll = 1, 0
+        end)
+        button(c, fx, top, "SORT: " .. (SORT_LABEL[bookSort] or "NAME"), colors.gray, colors.white, function()
+            for i, f in ipairs(SORTS) do
+                if f == bookSort then bookSort = SORTS[i % #SORTS + 1] break end
+            end
+            bookSel, bookScroll = 1, 0
+        end)
+        local rows = bottom - top - 4
         bookSel = math.max(1, math.min(bookSel, #book))
         bookScroll = math.max(0, math.min(bookScroll, #book - rows))
         if bookSel <= bookScroll then bookScroll = bookSel - 1 end
+        if bookSel > bookScroll + rows then bookScroll = bookSel - rows end
         for n = 1, rows do
             local idx = n + bookScroll
             local entry = book[idx]
             if entry then
-                local y = top + n - 1
-                local label = pad(string.format("%2d ", idx) .. string.upper(entry.name), listW)
+                local y = top + 1 + n
+                local label = pad((entry.fav and "*" or " ") .. string.format("%2d ", idx) .. string.upper(entry.name), listW)
                 local bg = entry.network and colors.cyan or colors.lightBlue
                 if idx == bookSel then bg = colors.white end
                 c:text(X1, y, label, colors.black, bg)
                 addButton(X1, y, X1 + listW - 1, y, function() bookSel = idx end)
             end
         end
+        if #book == 0 then c:text(X1, top + 2, "NOTHING HERE", colors.gray) end
+        -- under the list: jump to a letter
+        local ly = bottom - 1
+        local lx = X1
+        local letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        for i = 1, #letters do
+            local L = string.sub(letters, i, i)
+            local on = bookLetter == L
+            if lx + 1 > X2 then break end
+            c:text(lx, ly, L, on and colors.black or colors.lightGray, on and colors.yellow or colors.black)
+            addButton(lx, ly, lx, ly, function()
+                bookLetter = (bookLetter ~= L) and L or nil
+                bookSel, bookScroll = 1, 0
+            end)
+            lx = lx + 2
+        end
+        if bookLetter then
+            button(c, lx + 1, ly, "ALL", colors.gray, colors.white, function() bookLetter = nil end)
+        end
         local entry = book[bookSel]
         local dx = X1 + listW + 3
         if entry then
             local gi = gateInfo(entry.symbols)
-            c:text(dx, top, string.upper(entry.name), colors.white)
+            c:text(dx, top, string.upper(entry.name) .. (entry.fav and "  *" or ""), entry.fav and colors.yellow or colors.white)
             local kind = entry.book and "ADDRESS BOOK" or "GATE NETWORK"
             if entry.dim then kind = kind .. "  -  " .. dimName(entry.dim) end
             c:text(dx, top + 1, kind, entry.book and colors.lightBlue or colors.cyan)
             if entry.x then
                 local where = "X " .. entry.x .. (entry.y and ("  Y " .. entry.y) or "") .. "  Z " .. entry.z
-                if home and home.x and home.dim == entry.dim then
-                    where = where .. "  " .. math.floor(math.sqrt((entry.x - home.x) ^ 2 + (entry.z - home.z) ^ 2)) .. " BLOCKS"
-                end
+                local dist = distanceTo(entry)
+                if dist then where = where .. "  " .. dist .. " BLOCKS" end
                 c:text(dx, top + 2, where, colors.lightGray)
             end
             local h = data.history[entry.name]
@@ -721,7 +963,14 @@ local function drawOverlay(c, W, H, PW, PH, frame)
                 end
             end
             local bx = X1
-            bx = button(c, bx, bottom, "DIAL", colors.lime, colors.black, function() overlay = false actions.dial(bookSel) end)
+            bx = button(c, bx, bottom, "DIAL", colors.lime, colors.black, function()
+                overlay = false
+                actions.dialAddress(entry.name, entry.symbols)
+            end)
+            bx = button(c, bx, bottom, entry.fav and "UNFAVOURITE" or "FAVOURITE", colors.yellow, colors.black, function()
+                data.fav[entry.name] = (not entry.fav) or nil
+                save()
+            end)
             if entry.book then
                 bx = button(c, bx, bottom, "DELETE", colors.red, colors.white, function()
                     table.remove(data.book, entry.book)
@@ -738,7 +987,7 @@ local function drawOverlay(c, W, H, PW, PH, frame)
             bx = button(c, bx, bottom, "^", colors.gray, colors.white, function() bookSel = bookSel - 1 end)
             button(c, bx, bottom, "v", colors.gray, colors.white, function() bookSel = bookSel + 1 end)
         else
-            c:text(dx, top, "NO ADDRESSES YET", colors.lightGray)
+            c:text(dx, top + 2, "NO ADDRESSES HERE", colors.lightGray)
         end
         c:text(X2 - 22, bottom, pad(#book .. " DESTINATIONS", 22), colors.gray)
 
@@ -853,26 +1102,35 @@ local function drawOverlay(c, W, H, PW, PH, frame)
 
     elseif page == "log" then
         local rows = bottom - top - 1
-        logScroll = math.max(0, math.min(logScroll, #log - rows))
+        local shown = log
+        if logFilter == "travel" then
+            shown = {}
+            for _, e in ipairs(log) do if e.kind == "travel" then table.insert(shown, e) end end
+        end
+        logScroll = math.max(0, math.min(logScroll, #shown - rows))
         c:text(X1, top, pad("DAY", 6) .. pad("TIME", 7) .. "EVENT", colors.white)
-        local last = #log - logScroll
+        local last = #shown - logScroll
         local first = math.max(1, last - rows + 1)
         for i = first, last do
-            local e = log[i]
+            local e = shown[i]
             local y = top + 1 + i - first
             c:text(X1, y, pad(e.day and tostring(e.day) or "", 6) .. pad(e.t, 7) .. string.sub(e.long, 1, X2 - X1 - 12), e.c)
         end
-        if #log == 0 then c:text(X1, top + 1, "NOTHING LOGGED YET", colors.gray) end
+        if #shown == 0 then c:text(X1, top + 1, logFilter and "NO TRAVELLERS YET" or "NOTHING LOGGED YET", colors.gray) end
         local bx = X1
         bx = button(c, bx, bottom, "^ OLDER", colors.gray, colors.white, function() logScroll = logScroll + rows end)
         bx = button(c, bx, bottom, "v NEWER", colors.gray, colors.white, function() logScroll = logScroll - rows end)
         bx = button(c, bx, bottom, "NEWEST", colors.lightGray, colors.black, function() logScroll = 0 end)
+        bx = button(c, bx, bottom, logFilter and "SHOW ALL" or "TRAVELLERS", colors.cyan, colors.black, function()
+            logFilter = (not logFilter) and "travel" or nil
+            logScroll = 0
+        end)
         button(c, bx, bottom, "CLEAR LOG", colors.red, colors.white, function()
             log = {}
             logScroll = 0
             logEvent("LOG", "EVENT LOG CLEARED")
         end)
-        c:text(X2 - 22, bottom, pad(#log .. " EVENTS", 22), colors.gray)
+        c:text(X2 - 22, bottom, pad(#shown .. " EVENTS", 22), colors.gray)
 
     elseif page == "gate" then
         local hi = homeInfo()
@@ -930,6 +1188,22 @@ local function drawOverlay(c, W, H, PW, PH, frame)
                 function() data.alarm = not data.alarm save() end)
         button(c, bx, bottom, data.autoIris and "AUTO IRIS ON" or "AUTO IRIS OFF", colors.lightGray, colors.black,
                 function() data.autoIris = not data.autoIris save() end)
+        -- the second row: how it dials, its sounds, the pocket remote, and the self-destruct
+        local by2 = bottom - 1
+        bx = X1
+        bx = button(c, bx, by2, data.fastDial and "FAST DIAL ON" or "FAST DIAL OFF", colors.lightBlue, colors.black,
+                function() data.fastDial = not data.fastDial save() end)
+        bx = button(c, bx, by2, data.sounds and "SOUNDS ON" or "SOUNDS OFF", colors.lightBlue, colors.black,
+                function() data.sounds = not data.sounds save() end)
+        bx = button(c, bx, by2, data.remoteCode and "REMOTE ON" or "REMOTE OFF", colors.lightBlue, colors.black,
+                function() actions.setRemote() end)
+        if state.destruct then
+            button(c, bx, by2, "ABORT SELF-DESTRUCT", colors.lime, colors.black, function() actions.destructAbort() end)
+        elseif state.destructArm and os.clock() - state.destructArm < 5 then
+            button(c, bx, by2, "CONFIRM SELF-DESTRUCT", blink and colors.red or colors.orange, colors.white, function() actions.destruct() end)
+        else
+            button(c, bx, by2, "SELF-DESTRUCT", colors.red, colors.white, function() state.destructArm = os.clock() end)
+        end
     end
 end
 
@@ -1049,17 +1323,27 @@ local function drawMonitor()
     c:text(math.floor(sx2 / 2) - 10, lst, "LST CODE #2", colors.white)
     -- over the gate: where we're dialing, or how long the wormhole's been open
     local mid
-    if state.dialing then mid = "DIALING " .. string.upper(state.dialing)
-    elseif state.open and state.openedAt then mid = "WORMHOLE OPEN " .. clockText(os.clock() - state.openedAt) end
+    if state.destruct then mid = "SELF-DESTRUCT IN " .. clockText(state.destruct - os.clock())
+    elseif state.dialing then mid = "DIALING " .. string.upper(state.dialing)
+    elseif state.open and state.openedAt then
+        mid = "WORMHOLE OPEN " .. clockText(os.clock() - state.openedAt)
+        if state.travellers > 0 then mid = mid .. "   " .. state.travellers .. " THROUGH" end
+    end
     if mid then
         mid = " " .. string.sub(mid, 1, right - left - 4) .. " "          -- set into the screen's top border, like a title
-        c:text(math.floor(cx / 2) - math.floor(#mid / 2) + 1, 1, mid, state.dialing and colors.orange or colors.lime)
+        c:text(math.floor(cx / 2) - math.floor(#mid / 2) + 1, 1, mid,
+                state.destruct and (blink and colors.white or colors.red) or (state.dialing and colors.orange or colors.lime),
+                state.destruct and (blink and colors.red or colors.black) or nil)
     end
     local sy2 = math.min(PH - 9, sy1 + 16)
     c:rect(sx1, sy1, sx2, sy2, frame)
     for x = sx1 + 2, sx2 - 2, 3 do c:set(x, sy1 + 1, colors.cyan) end
     local word, colour
-    if not gate then word, colour = "NO GATE", colors.red
+    if state.destruct then
+        local left = math.max(0, math.ceil(state.destruct - os.clock()))
+        word, colour = blink and "DESTRUCT" or ("T-" .. clockText(left)), colors.red
+    elseif state.detonated and os.clock() - state.detonated < 6 then word, colour = "DETONATION", blink and colors.white or colors.red
+    elseif not gate then word, colour = "NO GATE", colors.red
     elseif state.shutdownUntil and os.clock() < state.shutdownUntil then word, colour = "SHUTDOWN", blink and colors.red or colors.orange
     elseif state.incoming then word, colour = "INCOMING", blink and colors.red or colors.black
     elseif state.dialing then word, colour = "ENGAGED", colors.red
@@ -1072,7 +1356,13 @@ local function drawMonitor()
 
     -- under the status word: the iris's state and the automatic iris (the IRIS button is by KEYBOARD)
     local ir = math.floor(sy2 / 3) + 2
-    if gate and ir <= H - 4 then
+    if state.destruct and ir <= H - 4 then
+        -- one big button while the base counts down
+        local x0, x1 = math.floor(sx1 / 2) + 1, math.floor(sx2 / 2)
+        local label = "ABORT SELF-DESTRUCT"
+        c:text(x0, ir, pad(string.rep(" ", math.floor((x1 - x0 + 1 - #label) / 2)) .. label, x1 - x0 + 1), colors.black, colors.lime)
+        addButton(x0, ir, x1, ir, function() actions.destructAbort() end)
+    elseif gate and ir <= H - 4 then
         local x0, x1 = math.floor(sx1 / 2) + 1, math.floor(sx2 / 2)
         local w = x1 - x0 + 1
         local closed = irisClosed()
@@ -1092,7 +1382,7 @@ local function drawMonitor()
     local by = H - 2
     c:text(3, by, "AUTH CODE", colors.white)
     c:text(3, by + 1, state.auth or "10183523652-4354393", colors.lightBlue)
-    local kx = math.floor(W * 0.47)
+    local kx = math.floor(W * 0.45)
     c:text(kx, by, "[########]", colors.lightGray)
     c:text(kx, by + 1, " KEYBOARD ", colors.black, colors.lightGray)
     addButton(kx, by, kx + 9, by + 1, function() overlay = true end)
@@ -1118,10 +1408,20 @@ local function drawMonitor()
         page = "log"
         logScroll = 0
     end)
-    local ux = kx + 19
+    -- right of LOG: close the gate (or stop the dial while it's still dialing); grey when there's nothing to close
+    if gate then
+        local busy = state.open or state.dialing or state.incoming
+        c:text(kx + 18, by, "[########]", colors.lightGray)
+        c:text(kx + 18, by + 1, state.dialing and "STOP DIAL " or "CLOSE GATE", busy and colors.white or colors.lightGray,
+                busy and colors.red or colors.gray)
+        addButton(kx + 18, by, kx + 27, by + 1, function()
+            if state.dialing then actions.abort() else actions.close() end
+        end)
+    end
+    local ux = kx + 29
     c:text(ux, by - 1, "USER: SGC DIAL OPERATOR", colors.lightBlue)
-    c:text(ux, by, "STATUS: " .. (gate and "ACTIVE" or "OFFLINE") .. "   IRIS: " .. (data.autoIris and "AUTO" or "MANUAL"), colors.lightBlue)
-    c:text(ux, by + 1, "SYS: " .. (state.incoming and "ALERT" or "NOMINAL") .. "   " .. string.upper(string.sub(state.message or "", 1, W - ux - 19)),
+    c:text(ux, by, "STATUS: " .. (gate and "ACTIVE" or "OFFLINE"), colors.lightBlue)
+    c:text(ux, by + 1, "SYS: " .. (state.incoming and "ALERT" or "NOMINAL") .. "   " .. string.upper(string.sub(state.message or "", 1, math.max(0, W - ux - 17))),
             state.incoming and colors.red or colors.lightBlue)
 
     -- the IDC window over the gate, while a code is being checked
@@ -1151,6 +1451,8 @@ local function drawMonitor()
     end
 
     if overlay then drawOverlay(c, W, H, PW, PH, frame) end
+    -- the detonation: the whole screen flashes white
+    if state.detonated and os.clock() - state.detonated < 2 and blink then c:fill(1, 1, PW, PH, colors.white) end
     if state.notice then
         local n = state.notice
         local nx = math.floor((W - #n) / 2)
@@ -1190,7 +1492,8 @@ local function drawTerminal()
     text(term, 2, 10, "[1-9] dial   [A] add address   [X] remove", colors.white, colors.black)
     text(term, 2, 11, "[C] add IDC code   [R] remove   [T] auto iris", colors.white, colors.black)
     text(term, 2, 12, "[I] iris   [G] close gate   [B] abort   [Q] quit", colors.white, colors.black)
-    text(term, 2, 13, "[P] our GDO code: " .. (data.gdo or "not set"), colors.white, colors.black)
+    text(term, 2, 13, "[P] GDO code: " .. (data.gdo or "not set") .. "   [F] fast dial: " .. (data.fastDial and "on" or "off")
+            .. "   [S] sounds: " .. (data.sounds and "on" or "off") .. "   [K] remote: " .. (data.remoteCode and "on" or "off"), colors.white, colors.black)
     local logLines = math.min(#log, 4)
     local y = 15
     for i, entry in ipairs(entries()) do
@@ -1214,6 +1517,10 @@ end
 local pending = nil                  -- the address the dialer is to dial next
 
 function actions.dialAddress(name, symbols)
+    if state.destruct then
+        state.detail = "SELF-DESTRUCT IN PROGRESS"
+        return
+    end
     if state.dialing then
         state.detail = "ALREADY DIALING " .. string.upper(state.dialing)
         return
@@ -1251,13 +1558,42 @@ function actions.sendGdo()
 end
 
 function actions.abort()
+    if not state.dialing then return end
+    state.abortRequested = "ABORTED BY THE OPERATOR"
     os.queueEvent("sgc_abort")
-    local ok, _, err = call("abortDialing")
-    state.dialing = nil
-    state.locked = 0
-    state.message = "DIALING ABORTED"
-    state.detail = ok and "" or string.upper(err)
-    logEvent("ABORT", "DIALING ABORTED", colors.yellow)
+end
+
+-- The self-destruct: armed with one tap, confirmed with a second within five seconds; a minute's countdown with the
+-- klaxon and the lights; abort any time before zero. At zero the gate shuts down, the iris closes, and every side of
+-- the computer gives a steady redstone signal for five seconds (the detonation, for whatever it's wired to).
+local DESTRUCT_SECONDS = 60
+
+function actions.destruct()
+    if state.destruct then return end
+    state.destructArm = nil
+    state.destruct = os.clock() + DESTRUCT_SECONDS
+    state.destructBeep = -1
+    if state.dialing then actions.abort() end
+    logEvent("DESTR", "SELF-DESTRUCT ACTIVATED: " .. DESTRUCT_SECONDS .. " SECONDS", colors.red)
+    state.message = "SELF-DESTRUCT ACTIVATED"
+end
+
+function actions.destructAbort()
+    if not state.destruct then return end
+    state.destruct = nil
+    logEvent("ABORT", "SELF-DESTRUCT ABORTED", colors.lime)
+    state.message = "SELF-DESTRUCT ABORTED"
+    sound("accept")
+end
+
+local function detonate()
+    state.destruct = nil
+    state.detonated = os.clock()
+    call("disengageGate")
+    setIris(true)
+    logEvent("BOOM", "SELF-DESTRUCT: DETONATION SIGNAL SENT", colors.red)
+    state.message = "DETONATION"
+    sound("boom")
 end
 
 local function prompt(label)
@@ -1316,6 +1652,13 @@ local function removeCode()
 end
 
 -- Asks on the computer's own screen, with a note on the wall screen to go and type there.
+local function setRemoteCode()
+    local code = prompt("The code a pocket computer needs to use this one (\"sgc remote\" on it), empty to turn the remote off:")
+    data.remoteCode = (code and code ~= "") and code or nil
+    save()
+    state.detail = data.remoteCode and "REMOTE ON" or "REMOTE OFF"
+end
+
 local function asking(f)
     state.notice = "TYPE ON THE DIALING COMPUTER'S KEYBOARD"
     drawMonitor()
@@ -1324,6 +1667,8 @@ local function asking(f)
 end
 
 function actions.addCode() asking(addCode) end
+
+function actions.setRemote() asking(setRemoteCode) end
 
 function actions.setGdo()
     asking(function()
@@ -1348,72 +1693,188 @@ end
 
 -- ------------------------------------------------------------------ dialing
 
--- Waits until the gate has locked `count` symbols (its chevron event, or the dialed address growing), up to `seconds`.
-local function waitLocked(count, seconds)
+-- The dialing engine: one dial at a time, every wait cut short by ABORT (or an incoming wormhole, or the
+-- self-destruct), each step with its own time limit, a busy gate tried again, and one more go at the whole address if
+-- a chevron fails to lock for no clear reason.
+
+-- Waits `seconds`; false if the dial was called off meanwhile.
+local function pause(seconds)
+    local timer = os.startTimer(seconds)
+    while true do
+        if state.abortRequested then return false end
+        local e, id = os.pullEvent()
+        if e == "sgc_abort" or state.abortRequested then return false end
+        if e == "timer" and id == timer then return true end
+    end
+end
+
+-- Calls a gate method, trying again while the gate answers "busy" (it is for a moment after each chevron).
+local function patiently(seconds, method, ...)
     local deadline = os.clock() + seconds
-    local timer = os.startTimer(0.5)
+    while true do
+        local ok, code, err = call(method, ...)
+        if ok then return true end
+        local text = string.lower(tostring(code) .. " " .. tostring(err))
+        if not string.find(text, "busy") or os.clock() > deadline then return false, err or code end
+        if not pause(0.5) then return false, "aborted" end
+    end
+end
+
+-- Waits until the gate has `count` symbols in its dialed address (or a chevron event says so), up to `seconds`.
+local function waitCount(count, seconds, onEach)
+    local deadline = os.clock() + seconds
+    local timer = os.startTimer(0.3)
+    local seen = 0
     while os.clock() < deadline do
+        if state.abortRequested then return false end
         local e = table.pack(os.pullEvent())
-        if e[1] == "sgc_abort" then return false end
-        if e[1] == "stargate_chevron_engaged" then
+        if e[1] == "sgc_abort" or state.abortRequested then return false end
+        if e[1] == "stargate_chevron_engaged" or (e[1] == "timer" and e[2] == timer) then
             local n = dialedCount()
-            if n == nil or n >= count then return true end
-        elseif e[1] == "timer" and e[2] == timer then
-            local n = dialedCount()
+            if n and n > seen then
+                seen = n
+                if onEach then onEach(n) end
+            end
             if n and n >= count then return true end
-            timer = os.startTimer(0.5)
+            if e[1] == "stargate_chevron_engaged" and n == nil then return true end
+            if e[1] == "timer" then timer = os.startTimer(0.3) end
         end
     end
     return false
 end
 
--- Engages one symbol. The gate is "busy" for a moment after each chevron locks (the ring still settling), so a busy
--- answer is tried again for a while rather than taken as a failure.
-local function engage(symbol)
-    local deadline = os.clock() + 20
-    while true do
-        local ok, code, err = call("engageSymbol", symbol)
-        if ok then return ok, code, err end
-        local busy = string.find(string.lower(tostring(code) .. " " .. tostring(err)), "busy") ~= nil
-        if not busy or os.clock() > deadline then return ok, code, err end
-        local timer = os.startTimer(0.5)
-        repeat
-            local e, id = os.pullEvent()
-            if e == "sgc_abort" then return false, "aborted", "aborted" end
-        until e == "timer" and id == timer
-    end
+local function chevronLocked(n, symbol)
+    state.locked = n
+    local order = lockOrder(math.max(state.total, 7))
+    if order[n] then state.flash[order[n]] = os.clock() end
+    state.message = "CHEVRON " .. WORDS[n] .. (n == state.total and " LOCKED" or " ENCODED")
+    logEvent((n == state.total and "LOCK " or "CHV ") .. n, state.message .. (symbol and (": " .. symbol) or ""),
+            n == state.total and colors.orange or colors.lightBlue)
+    sound(n == state.total and "lock" or "chevron", 1 + n * 0.03)
+    os.queueEvent("sgc_redraw")
 end
 
--- Waits for the point of origin's chevron: its event, the dialed address reaching `count`, or `seconds` passing.
-local function waitOrigin(count, seconds)
-    local timer = os.startTimer(seconds)
-    local poll = os.startTimer(0.5)
-    while true do
-        local e = table.pack(os.pullEvent())
-        if e[1] == "sgc_abort" then return false end
-        if e[1] == "stargate_chevron_engaged" then return true end
-        if e[1] == "timer" and e[2] == timer then return false end
-        if e[1] == "timer" and e[2] == poll then
-            local n = dialedCount()
-            if n and n >= count then return true end
-            poll = os.startTimer(0.5)
+-- Turns the screen's ring to a symbol (alternating directions, as the gate does) and marks it under the top chevron.
+local function turnTo(n, symbol)
+    state.engaging = symbol
+    state.spinDir = (n % 2 == 1) and 1 or -1
+    state.ringTarget = ringAngleFor(symbol)
+    state.anim = { name = string.upper(symbol == "Point of Origin" and "ORIGIN" or symbol), box = n, start = os.clock() }
+end
+
+-- One go at dialing an address; returns true, or false and why (and whether it's worth another go).
+local function dialOnce(entry)
+    local symbols = entry.symbols
+    state.address = {}
+    for k, sym in ipairs(symbols) do state.address[k] = sym end
+    table.insert(state.address, "Point of Origin")
+    state.total = #state.address
+    state.locked = 0
+    state.flash = {}
+    -- fast: hand JSG the whole address, as a DHD does, and follow its chevrons
+    local fast = false
+    if data.fastDial and gate.dialAddress then
+        local ok = call("dialAddress", symbols)
+        if ok then
+            fast = true
+            state.message = "DIALING (FAST)"
+            local okAll = waitCount(#symbols, 10 + 6 * #symbols, function(n)
+                if n <= #symbols then
+                    turnTo(math.min(n + 1, #symbols), symbols[math.min(n + 1, #symbols)])
+                    chevronLocked(n, symbols[n])
+                end
+            end)
+            if not okAll then
+                if state.abortRequested then return false, state.abortRequested end
+                return false, "THE GATE STOPPED DIALING", true
+            end
         end
     end
+    if not fast then
+        for n, symbol in ipairs(symbols) do
+            turnTo(n, symbol)
+            state.message = "ENCODING CHEVRON " .. WORDS[n]
+            local ok, err = patiently(20, "engageSymbol", symbol)
+            if not ok then
+                if state.abortRequested then return false, state.abortRequested end
+                return false, "CHEVRON " .. WORDS[n] .. " FAILED TO ENCODE: " .. string.upper(tostring(err))
+            end
+            if not waitCount(n, 20) then
+                if state.abortRequested then return false, state.abortRequested end
+                return false, "CHEVRON " .. WORDS[n] .. " DID NOT LOCK", true
+            end
+            chevronLocked(n, symbol)
+        end
+    end
+    -- the point of origin, unless the gate locked it already
+    local origin = #symbols + 1
+    refresh()
+    if not state.open and (dialedCount() or 0) < origin then
+        turnTo(origin, "Point of Origin")
+        state.message = "ENCODING THE POINT OF ORIGIN"
+        local locked, err = false, "no point of origin"
+        for _, o in ipairs(ORIGIN) do
+            local ok, e2 = patiently(15, "engageSymbol", o)
+            if ok then
+                locked = true
+                break
+            end
+            err = e2
+            if state.abortRequested then return false, state.abortRequested end
+        end
+        if not locked then return false, "THE POINT OF ORIGIN DID NOT LOCK: " .. string.upper(tostring(err)) end
+        -- the gate may not count the origin in its dialed address: its chevron event, or a few seconds, will do
+        waitCount(origin, 6)
+        if state.abortRequested then return false, state.abortRequested end
+    end
+    state.engaging = nil
+    chevronLocked(origin, nil)
+    -- open the wormhole
+    refresh()
+    if not state.open then
+        local ok, err = patiently(15, "engageGate")
+        if not ok then
+            if state.abortRequested then return false, state.abortRequested end
+            return false, "UNABLE TO ESTABLISH A LOCK: " .. string.upper(tostring(err))
+        end
+    end
+    return true
 end
 
--- Opens the gate on the dialed address (engageGate), trying again for a while if the gate's still busy.
-local function openGate()
-    local deadline = os.clock() + 15
-    while true do
-        local ok, code, err = call("engageGate")
-        if ok then return ok, code, err end
-        local text = string.lower(tostring(code) .. " " .. tostring(err))
-        if not string.find(text, "busy") or os.clock() > deadline then return ok, code, err end
-        local timer = os.startTimer(0.5)
-        repeat
-            local e, id = os.pullEvent()
-            if e == "sgc_abort" then return false, "aborted", "aborted" end
-        until e == "timer" and id == timer
+local function dialSequence(entry)
+    refresh()
+    if state.open then return false, "THE GATE IS ALREADY ACTIVE: SHUT IT DOWN FIRST" end
+    -- every symbol a real glyph, in its proper name
+    local symbols = {}
+    for k, sym in ipairs(entry.symbols) do
+        local name = glyphName(sym)
+        if not name or name == "Point of Origin" then return false, "NOT A MILKY WAY GLYPH: " .. string.upper(tostring(sym)) end
+        symbols[k] = name
+    end
+    if #symbols < 6 then return false, "AN ADDRESS NEEDS AT LEAST 6 SYMBOLS" end
+    -- as many as this gate needs (a gate in another galaxy needs 7 or 8; one JSG doesn't know gets them all)
+    if #symbols > 6 then
+        local n = tonumber(keyed("getSymbolsNeeded", symbols)) or (#symbols + 1)
+        n = math.max(6, math.min(#symbols, n - 1))
+        local cut = {}
+        for k = 1, n do cut[k] = symbols[k] end
+        symbols = cut
+    end
+    -- enough power?
+    local power = keyed("getEnergyRequiredToDial", symbols)
+    if type(power) == "table" and power.canOpen == false then return false, "INSUFFICIENT POWER TO DIAL" end
+    local attempt = { name = entry.name, symbols = symbols }
+    for try = 1, 2 do
+        local ok, why, again = dialOnce(attempt)
+        if ok then return true, attempt end
+        call("abortDialing")
+        if not again or try == 2 or state.abortRequested then return false, why end
+        state.message = "RETRYING"
+        state.detail = why
+        logEvent("RETRY", why .. ": TRYING AGAIN", colors.yellow)
+        state.locked = 0
+        state.flash = {}
+        if not pause(3) then return false, state.abortRequested or "ABORTED" end
     end
 end
 
@@ -1423,91 +1884,41 @@ local function dialer()
         local entry = pending
         pending = nil
         if entry and gate then
-            -- how many of its symbols this gate needs (a gate in another galaxy needs 7 or 8)
-            local symbols = entry.symbols
-            if #symbols > 6 then
-                -- counted with the point of origin; a gate JSG doesn't know of gets every symbol it was given
-                local n = tonumber(keyed("getSymbolsNeeded", symbols)) or (#symbols + 1)
-                n = n - 1
-                n = math.max(6, math.min(#symbols, n))
-                symbols = {}
-                for k = 1, n do symbols[k] = entry.symbols[k] end
-            end
-            entry = { name = entry.name, symbols = symbols }
+            state.abortRequested = nil
             state.dialing = entry.name
-            state.address = {}
-            for k, s in ipairs(entry.symbols) do state.address[k] = s end
-            table.insert(state.address, "Point of Origin")
-            state.total = #state.address
-            state.locked = 0
             state.message = "DIALING " .. string.upper(entry.name)
             state.detail = ""
-            logEvent("DIAL", "DIALING " .. entry.name .. " (" .. #entry.symbols .. " SYMBOLS)", colors.orange)
+            logEvent("DIAL", "DIALING " .. entry.name .. " (" .. #entry.symbols .. " SYMBOLS)" .. (data.fastDial and ", FAST" or ""), colors.orange)
             os.queueEvent("sgc_redraw")
-            local failed = false
-            for n, symbol in ipairs(entry.symbols) do
-                state.anim = { name = string.upper(symbol), box = n, start = os.clock() }
-                local ok, _, err = engage(symbol)
-                if not ok then
-                    state.message = "CHEVRON " .. WORDS[n] .. " FAILED TO ENCODE"
-                    state.detail = string.upper(symbol .. ": " .. err)
-                    logEvent("FAIL " .. n, "CHEVRON " .. WORDS[n] .. " FAILED: " .. err, colors.red)
-                    failed = true
-                    break
-                end
-                if not waitLocked(n, 20) then
-                    state.message = "CHEVRON " .. WORDS[n] .. " DID NOT LOCK"
-                    logEvent("FAIL " .. n, "CHEVRON " .. WORDS[n] .. " DID NOT LOCK", colors.red)
-                    failed = true
-                    break
-                end
-                state.locked = n
-                state.message = "CHEVRON " .. WORDS[n] .. " ENCODED"
-                logEvent("CHV " .. n, "CHEVRON " .. WORDS[n] .. " ENCODED: " .. symbol)
-                os.queueEvent("sgc_redraw")
+            local ok, result = dialSequence(entry)
+            state.engaging = nil
+            state.ringTarget = nil
+            if ok then
+                local dialed = result
+                state.message = "WORMHOLE ESTABLISHED"
+                state.detail = string.upper(entry.name)
+                local h = data.history[entry.name] or { count = 0 }
+                h.count = h.count + 1
+                h.last = (log[#log] and log[#log].t) or ""
+                data.history[entry.name] = h
+                data.last = { name = entry.name, symbols = dialed.symbols }
+                save()
+                logEvent("OPEN", "WORMHOLE ESTABLISHED: " .. entry.name, colors.lime)
+                if data.gdo then actions.sendGdo() end
+            else
+                local why = tostring(result or "FAILED")
+                local aborted = state.abortRequested ~= nil
+                call("abortDialing")
+                state.message = aborted and "DIALING ABORTED" or "DIALING FAILED"
+                state.detail = why
+                state.locked = 0
+                state.address = {}
+                state.total = 0
+                logEvent(aborted and "ABORT" or "FAIL", (aborted and "DIALING ABORTED: " or "DIALING FAILED: ") .. why,
+                        aborted and colors.yellow or colors.red)
+                sound("fail")
             end
-            if not failed then
-                local ok, err = false, "no point of origin"
-                state.anim = { name = "ORIGIN", box = #entry.symbols + 1, start = os.clock() }
-                for _, origin in ipairs(ORIGIN) do
-                    local r, _x
-                    r, _x, err = engage(origin)
-                    if r then
-                        ok = true
-                        break
-                    end
-                end
-                if ok then
-                    -- the point of origin: the gate may not count it in its dialed address, so its chevron event
-                    -- (or a few seconds) is enough; then open the gate, trying again while it's still busy locking
-                    waitOrigin(#entry.symbols + 1, 6)
-                    state.locked = #entry.symbols + 1
-                    state.message = "CHEVRON " .. WORDS[state.locked] .. " LOCKED"
-                    logEvent("LOCK " .. state.locked, "CHEVRON " .. WORDS[state.locked] .. " LOCKED", colors.orange)
-                    os.queueEvent("sgc_redraw")
-                    local opened, _, e2 = openGate()
-                    if opened then
-                        state.message = "WORMHOLE ESTABLISHED"
-                        local h = data.history[entry.name] or { count = 0 }
-                        h.count = h.count + 1
-                        h.last = (log[#log] and log[#log].t) or ""
-                        data.history[entry.name] = h
-                        data.last = { name = entry.name, symbols = entry.symbols }
-                        save()
-                        state.detail = string.upper(entry.name)
-                        logEvent("OPEN", "WORMHOLE ESTABLISHED: " .. entry.name, colors.lime)
-                        if data.gdo then actions.sendGdo() end
-                    else
-                        state.message = "UNABLE TO ESTABLISH A LOCK"
-                        state.detail = string.upper(tostring(e2))
-                        logEvent("NOLOCK", "UNABLE TO ESTABLISH A LOCK: " .. tostring(e2), colors.red)
-                    end
-                else
-                    state.message = "POINT OF ORIGIN DID NOT LOCK"
-                    logEvent("ORIG X", "POINT OF ORIGIN DID NOT LOCK", colors.red)
-                    state.detail = string.upper(tostring(err))
-                end
-            end
+            state.abortRequested = nil
             state.dialing = nil
             os.queueEvent("sgc_redraw")
         end
@@ -1515,6 +1926,51 @@ local function dialer()
 end
 
 -- ------------------------------------------------------------------ events
+
+-- ------------------------------------------------------------------ the pocket remote: this computer's side
+
+-- What a remote is told: the gate, the dial, and the destinations (by name).
+local function snapshot()
+    local names = {}
+    for _, e in ipairs(entries()) do
+        table.insert(names, e.name)
+        if #names >= 80 then break end
+    end
+    return {
+        status = state.status, iris = state.iris, energy = state.energy, maxEnergy = state.maxEnergy,
+        dialing = state.dialing, locked = state.locked, total = state.total, incoming = state.incoming, open = state.open,
+        message = state.message, detail = state.detail, destruct = state.destruct and math.ceil(state.destruct - os.clock()) or nil,
+        names = names,
+    }
+end
+
+-- A request from a pocket computer: { cmd = "status" | "dial" | "iris" | "close" | "abort", code = ..., name = ... }.
+-- Nothing is answered without the remote code set on this computer.
+local function remoteRequest(id, msg, protocol)
+    if protocol ~= "sgc" or type(msg) ~= "table" then return end
+    if not data.remoteCode then
+        rednet.send(id, { ok = false, err = "REMOTE OFF ON THIS COMPUTER" }, "sgc")
+        return
+    end
+    if msg.code ~= data.remoteCode then
+        rednet.send(id, { ok = false, err = "WRONG CODE" }, "sgc")
+        logEvent("REMOTE", "REMOTE REFUSED: WRONG CODE FROM COMPUTER " .. tostring(id), colors.red)
+        return
+    end
+    if msg.cmd == "dial" and msg.name then
+        for _, e in ipairs(entries()) do
+            if e.name == msg.name then
+                actions.dialAddress(e.name, e.symbols)
+                logEvent("REMOTE", "REMOTE DIAL FROM COMPUTER " .. tostring(id) .. ": " .. e.name)
+                break
+            end
+        end
+    elseif msg.cmd == "iris" then actions.iris()
+    elseif msg.cmd == "close" then actions.close()
+    elseif msg.cmd == "abort" then actions.abort()
+    end
+    rednet.send(id, { ok = true, state = snapshot() }, "sgc")
+end
 
 local function lastString(e)
     for i = e.n, 2, -1 do
@@ -1526,6 +1982,11 @@ end
 local function onEvent(e)
     local name = e[1]
     if name == "stargate_wormhole_incoming" then
+        if state.dialing then                                  -- something's coming in: our dial can't go on
+            state.abortRequested = "INTERRUPTED BY AN INCOMING WORMHOLE"
+            os.queueEvent("sgc_abort")
+        end
+        sound("incoming")
         state.incoming = true
         state.message = "UNSCHEDULED OFFWORLD ACTIVATION"
         if data.alarm then logEvent("ALERT", "BASE ALERT SOUNDED", colors.red) end
@@ -1544,18 +2005,36 @@ local function onEvent(e)
         local known = data.idc[code]
         state.idc = { code = code, name = known and known.name or "", ok = known and known.allow or false, t = os.clock() }
         if known and known.allow then
+            sound("accept")
             state.message = "IDC RECEIVED: " .. string.upper(known.name)
             logEvent("IDC OK", "IDC " .. code .. " RECOGNISED: " .. known.name, colors.lime)
             state.detail = "OPENING THE IRIS"
             setIris(false)
             call("sendMessageToIncoming", "Code accepted: " .. known.name .. ". The iris is open.")
         else
+            sound("reject")
             state.message = "UNKNOWN IDC: " .. code
             logEvent("IDC ??", "IDC " .. code .. " NOT RECOGNISED", colors.red)
             state.detail = "THE IRIS STAYS CLOSED"
             call("sendMessageToIncoming", "Code not recognised. The iris stays closed.")
         end
+    elseif name == "stargate_wormhole_open_unstable" then
+        state.kawoosh = os.clock()                            -- the burst as the wormhole forms
+        sound("open")
+    elseif name == "stargate_event_horizon_traveler" then
+        -- someone (or something) went through: arriving if the wormhole's coming in, leaving if it's ours
+        local what = lastString(e) or "unknown"
+        local who = string.upper(string.gsub(string.gsub(what, "^.-:", ""), "_", " "))
+        state.travellers = state.travellers + 1
+        logEvent(state.incoming and "ARRIVE" or "DEPART", (state.incoming and "TRAVELLER ARRIVED: " or "TRAVELLER DEPARTED: ") .. who,
+                colors.white, "travel")
+        sound("travel")
     elseif name == "stargate_wormhole_close_fully" then
+        if state.travellers > 0 then
+            logEvent("TRAVEL", state.travellers .. " THROUGH THE GATE THIS TIME", colors.white, "travel")
+        end
+        state.travellers = 0
+        sound("close")
         state.incoming = false
         state.address = {}
         state.locked = 0
@@ -1571,10 +2050,13 @@ local function onEvent(e)
         local x, y = e[3], e[4]
         for _, b in ipairs(buttons) do
             if x >= b[1] and x <= b[3] and y >= b[2] and y <= b[4] then
+                sound("key")
                 b[5]()
                 break
             end
         end
+    elseif name == "rednet_message" then
+        remoteRequest(e[2], e[3], e[4])
     elseif name == "char" then
         local c = string.lower(e[2])
         local n = tonumber(c)
@@ -1594,6 +2076,15 @@ local function onEvent(e)
             local code = prompt("Our GDO code, sent to the far gate's iris when we dial out (empty to clear):")
             data.gdo = (code and code ~= "") and code or nil
             save()
+        elseif c == "f" then
+            data.fastDial = not data.fastDial
+            save()
+            state.detail = "FAST DIAL " .. (data.fastDial and "ON" or "OFF")
+        elseif c == "s" then
+            data.sounds = not data.sounds
+            save()
+            state.detail = "SOUNDS " .. (data.sounds and "ON" or "OFF")
+        elseif c == "k" then setRemoteCode()
         elseif c == "q" then return "quit"
         end
     elseif name == "peripheral" or name == "peripheral_detach" or name == "monitor_resize" then
@@ -1621,15 +2112,173 @@ local function ui()
             tick = tick + 1
             blink = math.floor(tick / 2) % 2 == 0
             timer = os.startTimer(0.2)
-            alert(state.incoming and data.alarm and blink)
+            -- the screen's ring turns toward the symbol being encoded
+            if state.ringTarget then
+                local left = ((state.ringTarget - state.ringAngle) * state.spinDir) % 360
+                if left < 15 then
+                    state.ringAngle = state.ringTarget
+                    state.ringTarget = nil
+                else
+                    state.ringAngle = (state.ringAngle + state.spinDir * 15) % 360
+                end
+            end
+            -- the self-destruct: a beep a second, faster at the end; at zero, the detonation
+            if state.destruct then
+                local left = state.destruct - os.clock()
+                if left <= 0 then
+                    detonate()
+                elseif tick % ((left < 10) and 2 or 5) == 0 then
+                    sound("siren", left < 10 and 1.4 or 1)
+                end
+            end
+            -- the klaxon while something's coming in
+            if state.incoming and data.alarm and tick % 4 == 0 then sound("klaxon", (tick % 8 == 0) and 1 or 1.25) end
+            local detonating = state.detonated and os.clock() - state.detonated < 5
+            alert(detonating or (state.destruct and tick % 2 == 0) or (state.incoming and data.alarm and blink))
         elseif onEvent(e) == "quit" then
             return
         end
     end
 end
 
+-- ------------------------------------------------------------------ the pocket remote ("sgc remote")
+
+local function runRemote()
+    local w, h = term.getSize()
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name) == "modem" then pcall(rednet.open, name) end
+    end
+    if not rednet.isOpen() then
+        print("This computer needs a modem (a wireless or ender modem on a pocket computer).")
+        return
+    end
+    local CODE = "/sgc/remote"
+    local code
+    if fs.exists(CODE) then
+        local f = fs.open(CODE, "r")
+        code = f.readAll()
+        f.close()
+    end
+    if not code or code == "" then
+        term.clear()
+        term.setCursorPos(1, 1)
+        print("Stargate Command remote")
+        print("Remote code (set on the dialing computer, key K):")
+        code = read("*")
+        local f = fs.open(CODE, "w")
+        f.write(code)
+        f.close()
+    end
+    local server = rednet.lookup("sgc")
+    local snap, err, sel, scroll = nil, nil, 1, 0
+    local function ask(msg)
+        if not server then server = rednet.lookup("sgc") end
+        if not server then
+            err = "NO STARGATE COMMAND FOUND"
+            return
+        end
+        msg.code = code
+        rednet.send(server, msg, "sgc")
+        local id, reply = rednet.receive("sgc", 3)
+        if not id then
+            err = "NO ANSWER"
+            return
+        end
+        if reply.ok then
+            snap, err = reply.state, nil
+        else
+            err = reply.err
+            if err == "WRONG CODE" then fs.delete(CODE) end
+        end
+    end
+    local function line(y, s, fg, bg)
+        term.setCursorPos(1, y)
+        term.setBackgroundColor(bg or colors.black)
+        term.setTextColor(fg or colors.white)
+        term.write(string.sub(s .. string.rep(" ", w), 1, w))
+    end
+    local buttonsAt = {}
+    local function redraw()
+        term.setBackgroundColor(colors.black)
+        term.clear()
+        line(1, " SGC REMOTE", colors.white, colors.blue)
+        if err then line(2, err, colors.red) end
+        if snap then
+            line(3, "GATE " .. tostring(snap.status), snap.incoming and colors.red or colors.lightBlue)
+            line(4, "IRIS " .. tostring(snap.iris), colors.orange)
+            if snap.destruct then line(5, "SELF-DESTRUCT T-" .. snap.destruct, colors.red)
+            elseif snap.dialing then line(5, "DIALING " .. snap.dialing .. " " .. snap.locked .. "/" .. snap.total, colors.yellow)
+            else line(5, tostring(snap.message), colors.lightGray) end
+            local rows = h - 8
+            scroll = math.max(0, math.min(scroll, #snap.names - rows))
+            for n = 1, rows do
+                local i = n + scroll
+                local name = snap.names[i]
+                if name then
+                    line(6 + n, " " .. name, colors.black, i == sel and colors.white or colors.lightBlue)
+                end
+            end
+        else
+            line(4, "Connecting...", colors.lightGray)
+        end
+        buttonsAt = {}
+        local labels = { { "DIAL", colors.lime }, { "IRIS", colors.orange }, { "OFF", colors.red }, { "STOP", colors.yellow }, { "^", colors.gray }, { "v", colors.gray } }
+        local x = 1
+        for _, b in ipairs(labels) do
+            term.setCursorPos(x, h)
+            term.setBackgroundColor(b[2])
+            term.setTextColor(colors.black)
+            term.write(b[1])
+            table.insert(buttonsAt, { x, x + #b[1] - 1, b[1] })
+            x = x + #b[1] + 1
+        end
+        term.setBackgroundColor(colors.black)
+    end
+    ask({ cmd = "status" })
+    local timer = os.startTimer(1)
+    while true do
+        redraw()
+        local e = table.pack(os.pullEvent())
+        if e[1] == "timer" and e[2] == timer then
+            ask({ cmd = "status" })
+            timer = os.startTimer(1)
+        elseif e[1] == "mouse_click" then
+            local x, y = e[3], e[4]
+            if y == h then
+                for _, b in ipairs(buttonsAt) do
+                    if x >= b[1] and x <= b[2] then
+                        if b[3] == "DIAL" and snap and snap.names[sel] then ask({ cmd = "dial", name = snap.names[sel] })
+                        elseif b[3] == "IRIS" then ask({ cmd = "iris" })
+                        elseif b[3] == "OFF" then ask({ cmd = "close" })
+                        elseif b[3] == "STOP" then ask({ cmd = "abort" })
+                        elseif b[3] == "^" then scroll = scroll - (h - 8)
+                        elseif b[3] == "v" then scroll = scroll + (h - 8) end
+                    end
+                end
+            elseif y > 6 and snap then
+                sel = y - 6 + scroll
+            end
+        elseif e[1] == "mouse_scroll" then
+            scroll = scroll + e[2]
+        elseif e[1] == "key" and e[2] == keys.q then
+            term.setBackgroundColor(colors.black)
+            term.clear()
+            term.setCursorPos(1, 1)
+            return
+        end
+    end
+end
+
+if args[1] == "remote" or (pocket and not peripheral.find("stargate")) then
+    runRemote()
+    return
+end
+
 loadData()
 findDevices()
+if rednet and rednet.isOpen() then
+    pcall(rednet.host, "sgc", "sgc-" .. (os.getComputerID and os.getComputerID() or 0))
+end
 do
     -- an authorisation code for this computer, the same every time
     local id = os.getComputerID and os.getComputerID() or 0
