@@ -25,6 +25,7 @@ local data = {
     fastDial = false,  -- dial the whole address at once (JSG's own dialing, like a DHD) instead of chevron by chevron
     sounds = true,     -- chevrons, klaxon and kawoosh through any speaker on the computer
     remoteCode = nil,  -- the code a pocket computer needs to use this computer ("sgc remote"); none = no remote
+    teamsSeen = {},    -- the SG teams' IDCs already added to the list (one removed by hand isn't put back)
 }
 
 local function loadData()
@@ -44,6 +45,7 @@ local function loadData()
         data.fastDial = loaded.fastDial and true or false
         if loaded.sounds ~= nil then data.sounds = loaded.sounds end
         data.remoteCode = loaded.remoteCode
+        data.teamsSeen = loaded.teamsSeen or {}
     end
 end
 
@@ -61,9 +63,30 @@ local network = {}
 local home = nil
 local networkRead = -100
 
+-- The SG teams' IDCs, written to /sgc/teams by Eclipse Gate: { name, code } for each. A team coming home sends its
+-- code ahead of it; each is added to the IDC list, allowed, the first time it's seen here (after that the list is
+-- yours: block one, rename it or remove it and it stays that way).
+local function loadTeams()
+    if not fs.exists("/sgc/teams") then return end
+    local f = fs.open("/sgc/teams", "r")
+    local list = textutils.unserialize(f.readAll())
+    f.close()
+    if type(list) ~= "table" then return end
+    local changed = false
+    for _, t in ipairs(list) do
+        if type(t) == "table" and t.code and not data.teamsSeen[t.code] then
+            data.teamsSeen[t.code] = true
+            if not data.idc[t.code] then data.idc[t.code] = { name = t.name or "SG team", allow = true } end
+            changed = true
+        end
+    end
+    if changed then save() end
+end
+
 local function loadNetwork()
     if os.clock() - networkRead < 10 then return end
     networkRead = os.clock()
+    loadTeams()
     if not fs.exists("/sgc/gates") then return end
     local f = fs.open("/sgc/gates", "r")
     local list = textutils.unserialize(f.readAll())
@@ -261,7 +284,13 @@ local function setIris(closed)
     refresh()
     if irisClosed() == closed then return true end
     local ok, _, err = call("toggleIris")
-    if not ok then state.detail = "IRIS: " .. string.upper(err) end
+    if not ok then
+        if string.find(string.upper(err or ""), "MODE") then
+            state.detail = "IRIS: SET ITS MODE TO OC (COMPUTER) IN THE GATE"
+        else
+            state.detail = "IRIS: " .. string.upper(err)
+        end
+    end
     return ok
 end
 
@@ -1997,6 +2026,8 @@ local function onEvent(e)
             if setIris(true) then
                 state.autoClosed = true
                 logEvent("IRIS C", "IRIS CLOSED AUTOMATICALLY", colors.orange)
+            else
+                state.irisPending = true                      -- busy just now: try again until the wormhole forms
             end
         end
     elseif name == "stargate_iris_code_received" then
@@ -2042,6 +2073,7 @@ local function onEvent(e)
         state.message = "WORMHOLE DISENGAGED"
         logEvent("CLOSED", "WORMHOLE DISENGAGED")
         state.shutdownUntil = os.clock() + 3
+        state.irisPending = false
         if state.autoClosed then
             setIris(false)
             state.autoClosed = false
@@ -2129,6 +2161,17 @@ local function ui()
                     detonate()
                 elseif tick % ((left < 10) and 2 or 5) == 0 then
                     sound("siren", left < 10 and 1.4 or 1)
+                end
+            end
+            -- the automatic iris, if it couldn't close the moment the wormhole was announced (it was busy, or the
+            -- gate wasn't answering yet): again every second, until it's shut or the wormhole's formed
+            if state.irisPending and tick % 2 == 0 then
+                if not state.incoming or not data.autoIris or irisClosed() or state.open then
+                    state.irisPending = false
+                elseif setIris(true) then
+                    state.irisPending = false
+                    state.autoClosed = true
+                    logEvent("IRIS C", "IRIS CLOSED AUTOMATICALLY", colors.orange)
                 end
             end
             -- the klaxon while something's coming in
